@@ -128,6 +128,12 @@ cargo run --bin transformer_block
 
 The executable reports the shapes at each major stage and prints one head’s attention matrix. The zero upper triangle provides a direct visual check of causal visibility, while the final output confirms that the transformer block preserves the input shape.
 
+## 8. Sampling next tokens from vocabulary logits
+
+A transformer block produces contextual hidden states, not token IDs. In a complete GPT model, a final vocabulary projection maps the last position’s hidden state to a rank-one logit vector over the vocabulary. The package now provides Candle-compatible sampling at that boundary: full-vocabulary temperature scaling, fixed-support top-k filtering, adaptive-support nucleus (top-p) filtering, greedy decoding, and seeded categorical selection. [4]
+
+The sampling code intentionally remains separate from `TransformerBlock`, because it operates on vocabulary logits after the full transformer stack and output head. See [the sampling strategy guide](SAMPLING.md) for the equations, APIs, validation coverage, and a runnable demonstration.
+
 ## Boundaries and next step
 
 This package is an educational, deterministic forward-pass implementation. It deliberately omits parameter registration for optimization, gradient updates, training-mode dropout, GPU setup, batching utilities, vocabulary logits, embedding lookup, and multi-block GPT assembly. Those additions belong to a complete model and training pipeline. The implemented block nevertheless preserves the exact structural contract needed to stack transformer layers in a GPT architecture. [1] [2]
@@ -140,6 +146,9 @@ This package is an educational, deterministic forward-pass implementation. It de
 
 [3] Ashish Vaswani et al., “Attention Is All You Need,” 2017. [Paper][3]
 
+[4] Ari Holtzman et al., “The Curious Case of Neural Text Degeneration,” 2019. [Paper][4]
+
 [1]: https://www.manning.com/books/build-a-large-language-model-from-scratch
 [2]: https://docs.rs/candle-core/0.6.0/candle_core/
 [3]: https://arxiv.org/abs/1706.03762
+[4]: https://arxiv.org/abs/1904.09751

@@ -8,7 +8,7 @@ This private study repository contains original Rust implementations and explana
 |---|---|---|
 | [`chapter-02`](chapter-02) | Text data preparation: tokenization, token IDs, special tokens, toy and GPT-2-compatible byte-level BPE, sliding-window supervision, and a Candle-only embedding/position pipeline. | Read `chapter-02/README.md`, run `cargo test`, then use `cargo run --bin embeddings_and_positions`. |
 | [`chapter-03`](chapter-03) | Attention mechanisms: Candle-based scaled dot-product attention, causal masking, efficient head splitting, multi-head recombination, and output projection. | Read `chapter-03/README.md`, run `cargo test --all-targets`, then use `cargo run --bin multi_head_attention`. |
-| [`chapter-04`](chapter-04) | GPT transformer layers: Candle layer normalization, causal multi-head attention, GELU feed-forward layers, residual connections, and pre-layer-normalized transformer blocks. | Read `chapter-04/README.md`, run `cargo test --all-targets`, then use `cargo run --bin transformer_block`. |
+| [`chapter-04`](chapter-04) | GPT transformer layers: Candle layer normalization, causal multi-head attention, GELU feed-forward layers, residual connections, pre-layer-normalized transformer blocks, and temperature/top-k/top-p sampling utilities. | Read `chapter-04/README.md`, run `cargo test --all-targets`, then use `cargo run --bin sampling_strategies`. |
 
 ## Conventions
 

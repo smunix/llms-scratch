@@ -449,3 +449,280 @@ fn seeded_values(length: usize, seed: u64) -> (u64, Vec<f32>) {
         },
     )
 }
+
+/// A distribution over next-token IDs after an optional vocabulary filter.
+#[derive(Debug, Clone)]
+pub struct FilteredDistribution {
+    /// A rank-one Candle tensor of normalized probabilities over the full vocabulary.
+    pub probabilities: Tensor,
+    /// IDs retained by the filtering policy, ordered from highest to lowest logit.
+    pub retained_token_ids: Vec<usize>,
+}
+
+/// Next-token policy applied to a rank-one vocabulary-logit tensor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SamplingStrategy {
+    /// Select the largest raw logit without stochastic sampling.
+    Greedy,
+    /// Sample from the full vocabulary after dividing logits by `temperature`.
+    Temperature { temperature: f64 },
+    /// Keep the `k` largest temperature-scaled logits, then sample from the renormalized support.
+    TopK { temperature: f64, k: usize },
+    /// Keep the smallest descending-probability set whose cumulative mass reaches `p`.
+    TopP { temperature: f64, p: f32 },
+}
+
+/// Result of selecting one next-token ID.
+#[derive(Debug, Clone)]
+pub struct SampledToken {
+    pub token_id: usize,
+    pub distribution: FilteredDistribution,
+}
+
+/// A tiny deterministic categorical sampler for reproducible examples and tests.
+#[derive(Debug, Clone)]
+pub struct TokenSampler {
+    state: u64,
+}
+
+impl TokenSampler {
+    pub fn seeded(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    /// Select a next token from rank-one vocabulary logits.
+    pub fn sample(
+        &mut self,
+        logits: &Tensor,
+        strategy: SamplingStrategy,
+    ) -> Result<SampledToken, String> {
+        let distribution = match strategy {
+            SamplingStrategy::Greedy => {
+                let values = logits_to_values(logits)?;
+                let token_id = argmax_index(&values)?;
+                let probabilities = one_hot_distribution(values.len(), token_id, logits.device())?;
+                return Ok(SampledToken {
+                    token_id,
+                    distribution: FilteredDistribution {
+                        probabilities,
+                        retained_token_ids: vec![token_id],
+                    },
+                });
+            }
+            SamplingStrategy::Temperature { temperature } => {
+                temperature_distribution(logits, temperature)?
+            }
+            SamplingStrategy::TopK { temperature, k } => {
+                top_k_distribution(logits, temperature, k)?
+            }
+            SamplingStrategy::TopP { temperature, p } => {
+                top_p_distribution(logits, temperature, p)?
+            }
+        };
+        let probability_values = distribution
+            .probabilities
+            .to_vec1::<f32>()
+            .map_err(|error| format!("could not materialize sampling probabilities: {error}"))?;
+        let draw = self.next_unit_interval();
+        let token_id = probability_values
+            .iter()
+            .scan(0.0_f32, |cumulative, probability| {
+                *cumulative += probability;
+                Some(*cumulative)
+            })
+            .position(|cumulative| draw < cumulative)
+            .unwrap_or_else(|| {
+                distribution
+                    .retained_token_ids
+                    .last()
+                    .copied()
+                    .expect("a valid distribution retains at least one token")
+            });
+        Ok(SampledToken {
+            token_id,
+            distribution,
+        })
+    }
+
+    fn next_unit_interval(&mut self) -> f32 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.state >> 32) as f32) / ((u32::MAX as f32) + 1.0)
+    }
+}
+
+/// Convert logits into a full-vocabulary distribution after temperature scaling.
+pub fn temperature_distribution(
+    logits: &Tensor,
+    temperature: f64,
+) -> Result<FilteredDistribution, String> {
+    let values = logits_to_values(logits)?;
+    let scaled = temperature_scaled_logits(&values, temperature)?;
+    let retained_token_ids = ranked_indices(&scaled);
+    let probabilities = distribution_from_values(scaled, logits.device())?;
+    Ok(FilteredDistribution {
+        probabilities,
+        retained_token_ids,
+    })
+}
+
+/// Keep exactly the `k` largest temperature-scaled logits and renormalize their probability mass.
+pub fn top_k_distribution(
+    logits: &Tensor,
+    temperature: f64,
+    k: usize,
+) -> Result<FilteredDistribution, String> {
+    let values = logits_to_values(logits)?;
+    if k == 0 || k > values.len() {
+        return Err(format!(
+            "top-k must satisfy 1 <= k <= vocabulary size {}; received {k}",
+            values.len()
+        ));
+    }
+    let scaled = temperature_scaled_logits(&values, temperature)?;
+    let retained_token_ids = ranked_indices(&scaled).into_iter().take(k).collect_vec();
+    let masked = mask_to_retained(&scaled, &retained_token_ids);
+    let probabilities = distribution_from_values(masked, logits.device())?;
+    Ok(FilteredDistribution {
+        probabilities,
+        retained_token_ids,
+    })
+}
+
+/// Apply nucleus sampling: keep the smallest descending-probability set with cumulative mass at least `p`.
+pub fn top_p_distribution(
+    logits: &Tensor,
+    temperature: f64,
+    p: f32,
+) -> Result<FilteredDistribution, String> {
+    if !(0.0 < p && p <= 1.0) {
+        return Err(format!("top-p must satisfy 0 < p <= 1; received {p}"));
+    }
+    let values = logits_to_values(logits)?;
+    let scaled = temperature_scaled_logits(&values, temperature)?;
+    let full_probabilities = stable_softmax_values(&scaled)?;
+    let ranked = ranked_indices(&scaled);
+    let retained_token_ids = ranked
+        .into_iter()
+        .scan(0.0_f32, |cumulative, token_id| {
+            *cumulative += full_probabilities[token_id];
+            Some((token_id, *cumulative))
+        })
+        .take_while_inclusive(|(_, cumulative)| *cumulative < p)
+        .map(|(token_id, _)| token_id)
+        .collect_vec();
+    let masked = mask_to_retained(&scaled, &retained_token_ids);
+    let probabilities = distribution_from_values(masked, logits.device())?;
+    Ok(FilteredDistribution {
+        probabilities,
+        retained_token_ids,
+    })
+}
+
+fn logits_to_values(logits: &Tensor) -> Result<Vec<f32>, String> {
+    let vocabulary_size = logits
+        .dims1()
+        .map_err(|error| format!("sampling expects rank-one vocabulary logits: {error}"))?;
+    if vocabulary_size == 0 {
+        return Err("sampling requires a nonempty vocabulary".to_owned());
+    }
+    let values = logits
+        .to_vec1::<f32>()
+        .map_err(|error| format!("sampling expects F32 logits: {error}"))?;
+    values
+        .iter()
+        .any(|value| value.is_nan() || value.is_infinite())
+        .then_some(())
+        .map_or_else(
+            || Ok(values),
+            |_| Err("sampling logits must be finite F32 values".to_owned()),
+        )
+}
+
+fn temperature_scaled_logits(values: &[f32], temperature: f64) -> Result<Vec<f32>, String> {
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(format!(
+            "temperature must be finite and greater than zero; received {temperature}"
+        ));
+    }
+    Ok(values
+        .iter()
+        .map(|value| (*value as f64 / temperature) as f32)
+        .collect_vec())
+}
+
+fn ranked_indices(values: &[f32]) -> Vec<usize> {
+    let mut indices = (0..values.len()).collect_vec();
+    indices.sort_by(|left, right| {
+        values[*right]
+            .total_cmp(&values[*left])
+            .then_with(|| left.cmp(right))
+    });
+    indices
+}
+
+fn mask_to_retained(values: &[f32], retained_token_ids: &[usize]) -> Vec<f32> {
+    let retained = retained_token_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    values
+        .iter()
+        .enumerate()
+        .map(|(token_id, value)| {
+            retained
+                .contains(&token_id)
+                .then_some(*value)
+                .unwrap_or(f32::NEG_INFINITY)
+        })
+        .collect_vec()
+}
+
+fn stable_softmax_values(values: &[f32]) -> Result<Vec<f32>, String> {
+    let maximum = values
+        .iter()
+        .copied()
+        .max_by(f32::total_cmp)
+        .ok_or_else(|| "softmax requires nonempty values".to_owned())?;
+    let exponentials = values
+        .iter()
+        .map(|value| (*value - maximum).exp())
+        .collect_vec();
+    let denominator = exponentials.iter().sum::<f32>();
+    if !denominator.is_finite() || denominator <= 0.0 {
+        return Err("softmax denominator must be finite and positive".to_owned());
+    }
+    Ok(exponentials
+        .iter()
+        .map(|value| value / denominator)
+        .collect_vec())
+}
+
+fn distribution_from_values(values: Vec<f32>, device: &Device) -> Result<Tensor, String> {
+    let probabilities = stable_softmax_values(&values)?;
+    Tensor::from_vec(probabilities, values.len(), device)
+        .map_err(|error| format!("could not create Candle probability tensor: {error}"))
+}
+
+fn one_hot_distribution(
+    vocabulary_size: usize,
+    token_id: usize,
+    device: &Device,
+) -> Result<Tensor, String> {
+    let values = (0..vocabulary_size)
+        .map(|index| (index == token_id) as u8 as f32)
+        .collect_vec();
+    Tensor::from_vec(values, vocabulary_size, device)
+        .map_err(|error| format!("could not create greedy one-hot distribution: {error}"))
+}
+
+fn argmax_index(values: &[f32]) -> Result<usize, String> {
+    values
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index)
+        .ok_or_else(|| "argmax requires nonempty values".to_owned())
+}
