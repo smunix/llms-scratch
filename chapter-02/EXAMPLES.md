@@ -123,24 +123,35 @@ Each row carries a full target vector because a causal language model usually ma
 
 ### What the code does
 
-`EmbeddingTable::seeded(vocab_size, embedding_dim, seed)` constructs a small matrix of repeatable floating-point values. The pseudo-random generator is for a stable demo only. `lookup` then retrieves one matrix row for each token ID.
+`EmbeddingTable::seeded(vocab_size, embedding_dim, seed)` constructs a small matrix of repeatable floating-point values. It stores those weights in `nalgebra::DMatrix<f32>` rather than nested vectors. The pseudo-random generator is for a stable demo only. `lookup` selects one **row** for each token ID and returns an `L × d` nalgebra matrix, where `L` is the input length. The function checks all IDs and returns a descriptive error instead of silently selecting a wrong row. `nalgebra` provides the dynamic dense-matrix representation and elementwise arithmetic used by this transparent path. [2]
 
 ```rust
 let token_embeddings = token_table.lookup(&[2, 3, 5, 1])?;
+assert_eq!(token_embeddings.nrows(), 4);
+assert_eq!(token_embeddings.ncols(), 3);
 ```
 
-If the table has shape `V × d` and the input has `L` IDs, the result has shape `L × d`. The function checks all IDs and returns a descriptive error instead of silently returning a wrong row.
-
-The same lookup mechanism supplies positional vectors. We use position IDs `[0, 1, 2, …]`, then call `add_absolute_positions` to add corresponding dimensions row by row.
+The same lookup mechanism supplies positional vectors. We use position IDs `[0, 1, 2, …]`, then call `add_absolute_positions` to add same-shaped `DMatrix<f32>` values elementwise. The explicit dimension check makes a common tensor-shape bug visible before later model layers receive malformed inputs.
 
 ```rust
-let input_embeddings = add_absolute_positions(
+let visible_input = add_absolute_positions(
     &token_embeddings,
     &position_embeddings,
 )?;
 ```
 
-The function validates that sequence lengths match and that every token vector and position vector have the same width. These checks make a common tensor-shape bug explicit before later model layers receive malformed inputs.
+The program also uses Candle’s CPU tensor API to express the same input-pipeline operation in tensor form. `candle_input_embeddings` converts the two nalgebra-backed tables to tensors, runs `index_select` on the token and position indices, then combines the results with `broadcast_add`. This produces a Candle tensor with shape `L × d`. [3]
+
+```rust
+let tensor_input = candle_input_embeddings(
+    &token_table,
+    &position_table,
+    &[2, 3, 5, 1],
+)?;
+assert_eq!(tensor_input.dims(), &[4, 3]);
+```
+
+The executable materializes the Candle tensor and compares every value with the nalgebra result. Thus, one concise example shows both the algebraic view of an embedding table and the tensor interface that later transformer operations will use.
 
 ## Test suite as executable explanation
 
@@ -151,7 +162,8 @@ The function validates that sequence lengths match and that every token vector a
 | `tokenizer_splits_words_and_punctuation_without_lowercasing` | Word boundaries and case preservation are predictable. |
 | `tokenizer_round_trips_known_text_and_substitutes_unknown_text` | Known tokens decode correctly and OOV tokens use the fallback policy. |
 | `sliding_window_creates_one_position_shifted_targets` | Every target row is its input shifted by exactly one position. |
-| `embedding_lookup_retrieves_rows_and_position_vectors_are_added_elementwise` | The same ID retrieves the same vector, and position addition is elementwise. |
+| `nalgebra_embedding_lookup_retrieves_rows_and_position_vectors_are_added_elementwise` | The same ID retrieves the same nalgebra row, and position addition is elementwise. |
+| `candle_and_nalgebra_paths_produce_the_same_input_embeddings` | Candle indexed lookup and positional addition agree exactly with the nalgebra path. |
 | `bpe_merge_application_is_ordered` | Earlier BPE merges can create symbols used by later merges. |
 
 ## Suggested experiments
@@ -163,3 +175,5 @@ Change only one variable at a time and compare the printed data. Add a punctuati
 [1] GPT-2 model card, “openai-community/gpt2,” Hugging Face. [Model card][1]
 
 [1]: https://huggingface.co/openai-community/gpt2
+[2]: https://docs.rs/nalgebra/0.32.6/nalgebra/
+[3]: https://docs.rs/candle-core/0.6.0/candle_core/

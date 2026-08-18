@@ -16,8 +16,8 @@ Chapter 2 is the first implementation stage of the book’s end-to-end LLM workf
 | 2.4 | Special tokens represent unknown items and document boundaries. | `UNK`, `END_OF_TEXT`, fallback tokenizer |
 | 2.5 | BPE uses subwords so unfamiliar spellings remain representable. | `toy_bpe_merges.rs` |
 | 2.6 | A sliding window turns one token stream into shifted prediction pairs. | `sliding_window.rs` |
-| 2.7 | An embedding table looks up a learnable vector for each token ID. | `EmbeddingTable::lookup` |
-| 2.8 | Position vectors add order information missing from token lookup alone. | `embeddings_and_positions.rs` |
+| 2.7 | An embedding table looks up a learnable vector for each token ID. | `EmbeddingTable::lookup` with `nalgebra::DMatrix` |
+| 2.8 | Position vectors add order information missing from token lookup alone. | `embeddings_and_positions.rs` with nalgebra and Candle |
 
 ## 1. Why embeddings are necessary (Section 2.1)
 
@@ -186,11 +186,34 @@ Once each training example contains integer IDs, an embedding table converts eve
 ```rust
 let table = EmbeddingTable::seeded(8, 3, 123);
 let vectors = table.lookup(&[2, 3, 5, 1])?;
-assert_eq!(vectors.len(), 4);       // sequence length
-assert_eq!(vectors[0].len(), 3);    // embedding dimension
+assert_eq!(vectors.nrows(), 4);     // sequence length
+assert_eq!(vectors.ncols(), 3);     // embedding dimension
 ```
 
 The table in this project is seeded only to make the printed values repeatable. In an actual language model, the entries are trainable floating-point parameters. Backpropagation adjusts them in response to next-token loss, so a token’s vector becomes useful in the context of the entire model rather than because the initial random values are intrinsically meaningful. [1]
+
+### 7.1 Rust implementation: nalgebra for matrices, Candle for tensors
+
+`EmbeddingTable` now stores its weights as a `nalgebra::DMatrix<f32>` with shape `vocabulary_size × embedding_dimension`. The `lookup` method produces another `DMatrix<f32>` whose rows are selected in the requested token-ID order, making the chapter’s lookup operation visible as standard linear algebra. `add_absolute_positions` accepts two same-shaped matrices and returns their elementwise sum, with an explicit shape check before addition. The accompanying `nalgebra` crate supplies dynamically sized dense matrices and the fundamental elementwise and indexing operations used here. [3]
+
+The project also includes `candle_input_embeddings`, which builds the same sequence representation through Candle tensors. It materializes the embedding matrices on `Device::Cpu`, uses `Tensor::index_select` to retrieve token and position rows, and applies `broadcast_add` to combine them. The function returns a two-dimensional tensor of shape `(sequence_length, embedding_dimension)`; batching can add a leading axis later. Candle supplies these tensor operations without requiring a separate Python runtime. [4]
+
+| Path | Representation | Operation demonstrated | Intended teaching value |
+|---|---|---|---|
+| nalgebra | `DMatrix<f32>` | Explicit lookup rows and elementwise position addition. | Makes the `L × d` matrix algebra concrete and inspectable. |
+| Candle | `Tensor` on CPU | Tensor creation, `index_select`, and `broadcast_add`. | Mirrors the tensor-programming idiom that later model layers use. |
+| Equivalence test | Materialized rows | Exact comparison of both paths for fixed seeded tables. | Guards against shape or layout mistakes at the bridge boundary. |
+
+```rust
+let token_vectors = token_table.lookup(&[2, 3, 5, 1])?;       // nalgebra matrix
+let position_vectors = position_table.lookup(&[0, 1, 2, 3])?;
+let visible_input = add_absolute_positions(&token_vectors, &position_vectors)?;
+
+let tensor_input = candle_input_embeddings(&token_table, &position_table, &[2, 3, 5, 1])?;
+assert_eq!(tensor_input.dims(), &[4, 3]);
+```
+
+The `embeddings_and_positions` program prints both representations and exits successfully only when their materialized values agree exactly. The tests separately verify nalgebra row lookup, shape-correct addition, and Candle-versus-nalgebra equivalence.
 
 ## 8. Positional embeddings supply token order (Section 2.8)
 
@@ -240,7 +263,7 @@ cargo run --bin sliding_window
 cargo run --bin embeddings_and_positions
 ```
 
-The test suite verifies punctuation-aware tokenization, round-trip encoding/decoding, unknown-token substitution, shifted targets, embedding lookup, elementwise position addition, and ordered toy BPE merges.
+The test suite verifies punctuation-aware tokenization, round-trip encoding/decoding, unknown-token substitution, shifted targets, nalgebra matrix lookup, elementwise position addition, Candle tensor construction, nalgebra–Candle equivalence, GPT-2 byte-level BPE compatibility, and ordered toy BPE merges.
 
 ## Limitations and sensible next steps
 
@@ -252,3 +275,5 @@ These programs deliberately optimize for inspectability. They do not implement p
 
 [1]: https://www.manning.com/books/build-a-large-language-model-from-scratch
 [2]: https://huggingface.co/openai-community/gpt2
+[3]: https://docs.rs/nalgebra/0.32.6/nalgebra/
+[4]: https://docs.rs/candle-core/0.6.0/candle_core/

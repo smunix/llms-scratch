@@ -5,8 +5,18 @@ edition = "2021"
 description = "Runnable Rust examples for Chapter 2: Working with text data"
 
 [dependencies]
+candle-core = "0.6"
 fancy-regex = "0.13"
+# Candle 0.6 allows newer `half` releases that require a newer compiler than Rust 1.75.
+half = "=2.3.1"
+# Constrains Candle's Zip dependency away from an Edition 2024-only IndexMap release.
+indexmap = "=2.2.6"
 itertools = "0.12"
+nalgebra = "0.32"
+# Constrains Candle's optional num_enum macro helper to a Cargo 1.75-compatible release.
+proc-macro-crate = "=3.1.0"
+# Keeps Candle's CPU parallel runtime within the Rust 1.75 compatibility range.
+rayon-core = "=1.12.1"
 regex = "1.10"
 serde_json = "1.0"
 

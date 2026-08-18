@@ -4,8 +4,10 @@
 //! token IDs -> shifted training pairs -> token embeddings + positional embeddings.
 //! They are pedagogical implementations, not production tokenizers or tensor kernels.
 
+use candle_core::{Device, Tensor};
 use fancy_regex::Regex as FancyRegex;
 use itertools::Itertools;
+use nalgebra::DMatrix;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -164,83 +166,143 @@ pub fn sliding_window_examples(
         .collect())
 }
 
-/// A tiny embedding table. A real model learns these weights with backpropagation.
+/// A tiny embedding table stored as a nalgebra matrix with shape `(vocabulary × embedding width)`.
+/// A real model learns these weights with backpropagation.
 #[derive(Debug, Clone)]
 pub struct EmbeddingTable {
-    weights: Vec<Vec<f32>>,
+    weights: DMatrix<f32>,
 }
 
 impl EmbeddingTable {
     /// Make deterministic pseudo-random vectors without relying on a machine-learning framework.
     pub fn seeded(vocab_size: usize, embedding_dim: usize, seed: u64) -> Self {
-        let (_, weights) = (0..vocab_size).fold(
-            (seed, Vec::with_capacity(vocab_size)),
-            |(state, mut rows), _| {
-                let (next_state, row) = (0..embedding_dim).fold(
-                    (state, Vec::with_capacity(embedding_dim)),
-                    |(state, mut row), _| {
-                        let next = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                        let unit = ((next >> 32) as f32) / (u32::MAX as f32);
-                        row.push(unit - 0.5);
-                        (next, row)
-                    },
-                );
-                rows.push(row);
-                (next_state, rows)
+        let (_, values) = (0..(vocab_size * embedding_dim)).fold(
+            (seed, Vec::with_capacity(vocab_size * embedding_dim)),
+            |(state, mut values), _| {
+                let next = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let unit = ((next >> 32) as f32) / (u32::MAX as f32);
+                values.push(unit - 0.5);
+                (next, values)
             },
         );
-        Self { weights }
+        Self {
+            weights: DMatrix::from_row_slice(vocab_size, embedding_dim, &values),
+        }
     }
 
     pub fn rows(&self) -> usize {
-        self.weights.len()
+        self.weights.nrows()
     }
 
     pub fn embedding_dim(&self) -> usize {
-        self.weights.first().map_or(0, Vec::len)
+        self.weights.ncols()
     }
 
-    /// Perform an embedding lookup: ID `k` retrieves row `k`.
-    pub fn lookup(&self, token_ids: &[usize]) -> Result<Vec<Vec<f32>>, String> {
+    /// Expose the educational weight table as a nalgebra dynamic matrix.
+    pub fn matrix(&self) -> &DMatrix<f32> {
+        &self.weights
+    }
+
+    /// Perform an embedding lookup: ID `k` retrieves row `k` of the nalgebra matrix.
+    pub fn lookup(&self, token_ids: &[usize]) -> Result<DMatrix<f32>, String> {
         token_ids
             .iter()
-            .map(|id| {
-                self.weights
-                    .get(*id)
-                    .cloned()
-                    .ok_or_else(|| format!("token ID {id} exceeds vocabulary size {}", self.rows()))
-            })
-            .collect()
+            .find(|id| **id >= self.rows())
+            .map(|id| format!("token ID {id} exceeds vocabulary size {}", self.rows()))
+            .map_or_else(
+                || {
+                    let values = token_ids
+                        .iter()
+                        .flat_map(|id| self.weights.row(*id).iter().copied().collect_vec())
+                        .collect_vec();
+                    Ok(DMatrix::from_row_slice(
+                        token_ids.len(),
+                        self.embedding_dim(),
+                        &values,
+                    ))
+                },
+                Err,
+            )
+    }
+
+    fn candle_tensor(&self, device: &Device) -> Result<Tensor, String> {
+        let row_major = self
+            .weights
+            .row_iter()
+            .flat_map(|row| row.iter().copied().collect_vec())
+            .collect_vec();
+        Tensor::from_vec(row_major, (self.rows(), self.embedding_dim()), device)
+            .map_err(|error| format!("could not create Candle embedding tensor: {error}"))
     }
 }
 
-/// Add a learned absolute position vector to every token vector in one sequence.
+/// Add learned absolute position vectors to token vectors using nalgebra elementwise addition.
 ///
 /// The two matrices must have the same sequence length and embedding width. This is the
 /// operation usually broadcast across every batch member in a GPT-style input pipeline.
 pub fn add_absolute_positions(
-    token_embeddings: &[Vec<f32>],
-    position_embeddings: &[Vec<f32>],
-) -> Result<Vec<Vec<f32>>, String> {
-    if token_embeddings.len() != position_embeddings.len() {
-        return Err("token and position sequences must have the same length".to_owned());
+    token_embeddings: &DMatrix<f32>,
+    position_embeddings: &DMatrix<f32>,
+) -> Result<DMatrix<f32>, String> {
+    (token_embeddings.shape() == position_embeddings.shape())
+        .then(|| token_embeddings + position_embeddings)
+        .ok_or_else(|| {
+            format!(
+                "embedding shapes must match: token={:?}, position={:?}",
+                token_embeddings.shape(),
+                position_embeddings.shape()
+            )
+        })
+}
+
+/// Build position-aware input embeddings with Candle tensors on CPU.
+///
+/// Candle performs row lookup with `index_select` and adds the position tensor to the token tensor.
+/// The returned tensor has shape `(sequence length, embedding width)`; adding a leading batch axis
+/// is a separate batching concern.
+pub fn candle_input_embeddings(
+    token_table: &EmbeddingTable,
+    position_table: &EmbeddingTable,
+    token_ids: &[usize],
+) -> Result<Tensor, String> {
+    if token_table.embedding_dim() != position_table.embedding_dim() {
+        return Err("token and position embedding widths must match".to_owned());
+    }
+    if token_ids.len() > position_table.rows() {
+        return Err(format!(
+            "sequence length {} exceeds position-table length {}",
+            token_ids.len(),
+            position_table.rows()
+        ));
     }
 
-    token_embeddings
+    let device = Device::Cpu;
+    let token_ids = token_ids
         .iter()
-        .zip(position_embeddings)
-        .enumerate()
-        .map(|(position, (token, positional))| {
-            if token.len() != positional.len() {
-                return Err(format!("embedding width mismatch at position {position}"));
-            }
-            Ok(token
-                .iter()
-                .zip(positional)
-                .map(|(a, b)| a + b)
-                .collect_vec())
+        .map(|id| u32::try_from(*id).map_err(|_| format!("token ID {id} does not fit in u32")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let position_ids = (0..token_ids.len())
+        .map(|position| {
+            u32::try_from(position).map_err(|_| format!("position {position} does not fit in u32"))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let sequence_length = token_ids.len();
+    let token_index = Tensor::from_vec(token_ids, sequence_length, &device)
+        .map_err(|error| format!("could not create Candle token-index tensor: {error}"))?;
+    let position_index = Tensor::from_vec(position_ids, sequence_length, &device)
+        .map_err(|error| format!("could not create Candle position-index tensor: {error}"))?;
+
+    let token_embeddings = token_table
+        .candle_tensor(&device)?
+        .index_select(&token_index, 0)
+        .map_err(|error| format!("Candle token embedding lookup failed: {error}"))?;
+    let position_embeddings = position_table
+        .candle_tensor(&device)?
+        .index_select(&position_index, 0)
+        .map_err(|error| format!("Candle position embedding lookup failed: {error}"))?;
+    token_embeddings
+        .broadcast_add(&position_embeddings)
+        .map_err(|error| format!("Candle positional addition failed: {error}"))
 }
 
 /// Apply a learned BPE merge list to an already-split sequence of symbol strings.
