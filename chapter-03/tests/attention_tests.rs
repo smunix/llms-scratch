@@ -2,7 +2,6 @@ use candle_core::{Device, Tensor};
 use chapter_03_attention::{
     causal_additive_mask, MultiHeadAttentionConfig, MultiHeadCausalAttention,
 };
-use nalgebra::DMatrix;
 use pretty_assertions::assert_eq;
 
 fn config() -> MultiHeadAttentionConfig {
@@ -19,8 +18,12 @@ fn input(values: &[f32]) -> Tensor {
 }
 
 fn identity_attention() -> MultiHeadCausalAttention {
-    let identity = DMatrix::identity(4, 4);
-    MultiHeadCausalAttention::from_weight_matrices(
+    let identity_values = (0..4)
+        .flat_map(|row| (0..4).map(move |column| (row == column) as u8 as f32))
+        .collect::<Vec<_>>();
+    let identity =
+        Tensor::from_vec(identity_values, (4, 4), &Device::Cpu).expect("identity tensor is valid");
+    MultiHeadCausalAttention::from_weight_tensors(
         config(),
         identity.clone(),
         identity.clone(),

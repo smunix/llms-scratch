@@ -6,7 +6,7 @@
 
 ## What this package implements
 
-The Chapter 3 package implements the chapter’s efficient multi-head attention design in a single Rust module. It uses `nalgebra::DMatrix<f32>` only where transparent, deterministic projection-matrix construction is helpful; it uses Candle CPU tensors for the attention computation itself, including batched projections, head splitting, scaled dot products, causal masking, softmax, head recombination, and output projection. [2]
+The Chapter 3 package implements the chapter’s efficient multi-head attention design entirely with Candle CPU tensors. Candle owns deterministic projection-weight initialization, batched projections, head splitting, scaled dot products, causal masking, softmax, head recombination, and output projection. [2]
 
 | Chapter concept | Rust API | Key tensor shape |
 |---|---|---|
@@ -94,7 +94,7 @@ let config = MultiHeadAttentionConfig {
 assert_eq!(config.head_dim()?, 2);
 ```
 
-`MultiHeadCausalAttention::seeded` creates deterministic `nalgebra::DMatrix<f32>` weights for experimentation and converts them to Candle CPU tensors. Production training would replace that initialization route with trainable parameter tensors. The forward pass uses `broadcast_matmul` for linear projections; this shares a `d_in × d_out` weight matrix across the batch axis. [2]
+`MultiHeadCausalAttention::seeded` creates deterministic Candle CPU tensors for experimentation. `from_weight_tensors` accepts explicit Candle Q/K/V and output tensors, validates their rank and shapes, and supports controlled experiments without leaving the tensor runtime. Production training would replace this deterministic initialization with trainable parameter tensors. The forward pass uses `broadcast_matmul` for linear projections; this shares a `d_in × d_out` weight tensor across the batch axis. [2]
 
 ```rust
 let trace = attention.forward_with_trace(&input)?;

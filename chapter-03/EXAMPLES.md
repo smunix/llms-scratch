@@ -1,6 +1,6 @@
 # Multi-Head Causal Attention: Code Walkthrough
 
-This guide maps the executable Rust code to the Chapter 3 attention calculation. The implementation uses two complementary libraries: `nalgebra` provides explicit, inspectable dense matrices for deterministic Q/K/V and output weights, while Candle performs the rank-3 and rank-4 tensor operations of the actual attention pass. [1] [2]
+This guide maps the executable Rust code to the Chapter 3 attention calculation. The implementation uses Candle tensors exclusively for deterministic Q/K/V and output weights as well as every rank-3 and rank-4 attention operation. [1] [2]
 
 ## Configuration and shape invariant
 
@@ -25,11 +25,11 @@ assert_eq!(config.head_dim()?, 2);
 | `H` | 2 | Two independent attention heads. |
 | `d_head` | 2 | Two dimensions processed by each head. |
 
-## Deterministic weights and Candle conversion
+## Deterministic Candle weight tensors
 
-`MultiHeadCausalAttention::seeded` makes four deterministic `DMatrix<f32>` values: query, key, value, and output weights. It then converts each matrix to a Candle CPU tensor in row-major order. The seeded route exists solely to make tests and examples repeatable. Training later replaces these with learnable parameter tensors.
+`MultiHeadCausalAttention::seeded` makes four deterministic Candle CPU tensors: query, key, value, and output weights. The seeded route exists solely to make tests and examples repeatable. Training later replaces these with learnable parameter tensors.
 
-The constructor `from_weight_matrices` is particularly useful for experiments. It validates that every Q/K/V matrix has shape `d_in × d_out` and that the output matrix has shape `d_out × d_out`. The prefix-isolation test uses identity matrices through this constructor, removing random projections from the causality proof.
+The constructor `from_weight_tensors` is particularly useful for experiments. It validates that every Q/K/V tensor has shape `d_in × d_out` and that the output tensor has shape `d_out × d_out`. The prefix-isolation test uses Candle identity tensors through this constructor, removing random projections from the causality proof.
 
 ## Projection and head split
 

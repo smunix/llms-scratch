@@ -2,12 +2,10 @@
 //!
 //! The implementation keeps the matrix shapes from the chapter explicit:
 //! `input (B, T, d_in) -> Q/K/V (B, H, T, d_head) -> output (B, T, d_out)`.
-//! It is an educational, inference-oriented module: it uses Candle CPU tensors for
-//! tensor algebra and nalgebra matrices for transparent, deterministic weight setup.
+//! It is an educational, inference-oriented module implemented entirely with Candle CPU tensors.
 
 use candle_core::{Device, Tensor, D};
 use itertools::Itertools;
-use nalgebra::DMatrix;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MultiHeadAttentionConfig {
@@ -71,59 +69,55 @@ pub struct MultiHeadCausalAttention {
 }
 
 impl MultiHeadCausalAttention {
-    /// Construct deterministic demonstration weights through nalgebra matrices, then move them
-    /// into Candle CPU tensors. The values are trainable parameters in a full training system.
+    /// Construct deterministic Candle CPU tensors for the demonstration weights.
+    /// The values are trainable parameters in a full training system.
     pub fn seeded(config: MultiHeadAttentionConfig, seed: u64) -> Result<Self, String> {
         config.head_dim()?;
-        let (seed, query) = seeded_matrix(config.input_dim, config.output_dim, seed);
-        let (seed, key) = seeded_matrix(config.input_dim, config.output_dim, seed);
-        let (seed, value) = seeded_matrix(config.input_dim, config.output_dim, seed);
-        let (_, output) = seeded_matrix(config.output_dim, config.output_dim, seed);
-        Self::from_weight_matrices(config, query, key, value, output)
+        let device = Device::Cpu;
+        let (seed, query) = seeded_tensor(config.input_dim, config.output_dim, seed, &device)?;
+        let (seed, key) = seeded_tensor(config.input_dim, config.output_dim, seed, &device)?;
+        let (seed, value) = seeded_tensor(config.input_dim, config.output_dim, seed, &device)?;
+        let (_, output) = seeded_tensor(config.output_dim, config.output_dim, seed, &device)?;
+        Self::from_weight_tensors(config, query, key, value, output)
     }
 
-    /// Construct attention from explicit nalgebra matrices. This makes controlled tests and
-    /// experiments possible without hiding the learned linear projections.
-    pub fn from_weight_matrices(
+    /// Construct attention from explicit Candle weight tensors. This makes controlled tests and
+    /// experiments possible without leaving the tensor runtime.
+    pub fn from_weight_tensors(
         config: MultiHeadAttentionConfig,
-        query: DMatrix<f32>,
-        key: DMatrix<f32>,
-        value: DMatrix<f32>,
-        output: DMatrix<f32>,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        output: Tensor,
     ) -> Result<Self, String> {
         config.head_dim()?;
         let expected_qkv = (config.input_dim, config.output_dim);
         let expected_output = (config.output_dim, config.output_dim);
         [(&query, "query"), (&key, "key"), (&value, "value")]
             .into_iter()
-            .try_for_each(|(matrix, name)| {
-                (matrix.shape() == expected_qkv)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        format!(
-                            "{name} weight has shape {:?}; expected {:?}",
-                            matrix.shape(),
-                            expected_qkv
-                        )
-                    })
+            .try_for_each(|(tensor, name)| {
+                let shape = tensor
+                    .dims2()
+                    .map_err(|error| format!("{name} weight must be rank 2: {error}"))?;
+                (shape == expected_qkv).then_some(()).ok_or_else(|| {
+                    format!("{name} weight has shape {shape:?}; expected {expected_qkv:?}")
+                })
             })?;
-        (output.shape() == expected_output)
+        let output_shape = output
+            .dims2()
+            .map_err(|error| format!("output weight must be rank 2: {error}"))?;
+        (output_shape == expected_output)
             .then_some(())
             .ok_or_else(|| {
-                format!(
-                    "output weight has shape {:?}; expected {:?}",
-                    output.shape(),
-                    expected_output
-                )
+                format!("output weight has shape {output_shape:?}; expected {expected_output:?}")
             })?;
 
-        let device = Device::Cpu;
         Ok(Self {
             config,
-            query_weight: candle_matrix(&query, &device)?,
-            key_weight: candle_matrix(&key, &device)?,
-            value_weight: candle_matrix(&value, &device)?,
-            output_weight: candle_matrix(&output, &device)?,
+            query_weight: query,
+            key_weight: key,
+            value_weight: value,
+            output_weight: output,
         })
     }
 
@@ -268,7 +262,12 @@ fn softmax_last_dim(scores: &Tensor) -> Result<Tensor, String> {
         .map_err(|error| format!("softmax normalization failed: {error}"))
 }
 
-fn seeded_matrix(rows: usize, columns: usize, seed: u64) -> (u64, DMatrix<f32>) {
+fn seeded_tensor(
+    rows: usize,
+    columns: usize,
+    seed: u64,
+    device: &Device,
+) -> Result<(u64, Tensor), String> {
     let (state, values) = (0..(rows * columns)).fold(
         (seed, Vec::with_capacity(rows * columns)),
         |(state, mut values), _| {
@@ -278,14 +277,7 @@ fn seeded_matrix(rows: usize, columns: usize, seed: u64) -> (u64, DMatrix<f32>) 
             (next, values)
         },
     );
-    (state, DMatrix::from_row_slice(rows, columns, &values))
-}
-
-fn candle_matrix(matrix: &DMatrix<f32>, device: &Device) -> Result<Tensor, String> {
-    let row_major = matrix
-        .row_iter()
-        .flat_map(|row| row.iter().copied().collect_vec())
-        .collect_vec();
-    Tensor::from_vec(row_major, matrix.shape(), device)
-        .map_err(|error| format!("could not convert nalgebra matrix to Candle tensor: {error}"))
+    let tensor = Tensor::from_vec(values, (rows, columns), device)
+        .map_err(|error| format!("could not initialize Candle weight tensor: {error}"))?;
+    Ok((state, tensor))
 }

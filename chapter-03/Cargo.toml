@@ -7,7 +7,6 @@ description = "Runnable Candle implementations for Chapter 3: Coding attention m
 [dependencies]
 candle-core = "0.6"
 itertools = "0.12"
-nalgebra = "0.32"
 # Candle 0.6 permits newer transitive releases that require a compiler newer than Rust 1.75.
 half = "=2.3.1"
 indexmap = "=2.2.6"
