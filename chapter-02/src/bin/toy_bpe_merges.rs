@@ -21,6 +21,11 @@ fn main() {
         .map(|character| character.to_string())
         .collect_vec();
     let fallback = apply_bpe_merges(unfamiliar.clone(), &[]);
-    println!("\nUnknown spelling without matching merges: {}", fallback.iter().join(" | "));
-    println!("Character-level fallback is why BPE can represent text beyond a word-only vocabulary.");
+    println!(
+        "\nUnknown spelling without matching merges: {}",
+        fallback.iter().join(" | ")
+    );
+    println!(
+        "Character-level fallback is why BPE can represent text beyond a word-only vocabulary."
+    );
 }

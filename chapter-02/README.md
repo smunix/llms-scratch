@@ -105,6 +105,58 @@ assert_eq!(result, vec!["low", "er"]);
 
 > **Practical distinction:** Use the simple tokenizer to learn the pipeline. Use a tested tokenizer implementation and the exact vocabulary/merge files that match a pretrained model when compatibility matters. Token IDs are only meaningful relative to the tokenizer and embedding matrix that were trained together.
 
+## 5.1 A GPT-2-compatible byte-level BPE implementation in Rust
+
+The repository now includes a practical implementation in `Gpt2BpeTokenizer`. It loads the released GPT-2 `encoder.json` vocabulary and ranked `vocab.bpe` merge list from `assets/gpt2`, runs the GPT-2 pre-tokenization pattern, applies the reversible byte-to-Unicode transform, chooses BPE merges by lowest rank, maps the resulting pieces to IDs, and inverts every step during decoding. The bundled artifacts contain **50,257** vocabulary entries, including `<|endoftext|>` at ID `50256`. This matches the byte-level BPE format described for GPT-2, but it is still a learning-oriented single-threaded implementation rather than an optimized production tokenizer. [2]
+
+| Stage | Rust implementation | Why it is necessary for GPT-2 compatibility |
+|---|---|---|
+| Pre-tokenization | `FancyRegex` applies the GPT-2-style contraction, letter, number, punctuation, and whitespace pattern. | BPE merges must begin from the same text pieces as the model’s tokenizer. |
+| Byte transform | `gpt2_byte_to_unicode` maps all 256 bytes to reversible Unicode characters. | Any valid UTF-8 text remains representable without `<|unk|>`. |
+| Merge ranking | `from_files` assigns rank from each non-empty merge line after the `#version` header. | BPE repeatedly chooses the admissible adjacent pair with the smallest rank. |
+| Vocabulary lookup | `encoder.json` maps final serialized BPE strings to `u32` IDs. | The resulting IDs select the model’s corresponding embedding rows. |
+| Decoding | The decoder reverses ID lookup, then Unicode-to-byte mapping, then UTF-8 decoding. | This makes the text-to-ID transformation verifiably reversible. |
+
+The public constructor makes the model/tokenizer pairing explicit:
+
+```rust
+let tokenizer = Gpt2BpeTokenizer::from_files(
+    "assets/gpt2/encoder.json",
+    "assets/gpt2/vocab.bpe",
+)?;
+let ids = tokenizer.encode("Hello world!")?;
+assert_eq!(ids, vec![15496, 995, 0]);
+assert_eq!(tokenizer.decode(&ids)?, "Hello world!");
+```
+
+### How the ranked merge loop works
+
+For one pre-tokenized piece, the implementation first represents the byte-transformed text as one-symbol strings. It scans every adjacent pair that has a merge rank, selects the pair with the smallest rank, merges **every non-overlapping occurrence** of that selected pair, and repeats. When no adjacent pair appears in the ranked merge table, the remaining symbol sequence is final. Each final string must then exist in `encoder.json`.
+
+```text
+symbols = individual byte-mapped characters
+while an adjacent pair has a learned rank:
+    chosen_pair = eligible pair with minimum rank
+    symbols = merge every non-overlapping occurrence of chosen_pair
+IDs = encoder[symbol] for every final symbol
+```
+
+The implementation handles text such as `Café 🤖` without an unknown-token marker because UTF-8 becomes a sequence of bytes, every byte has a reversible mapped symbol, and the BPE vocabulary can always fall back to small byte-derived pieces. That is the key behavior the earlier word-level `SimpleTokenizer` cannot provide. The test suite also proves round-trip handling of multiple `<|endoftext|>` occurrences rather than treating the marker as ordinary text. [2]
+
+> **Compatibility rule.** The `encoder.json`, `vocab.bpe`, and a GPT-2 embedding table form one contract. Use them together. A different vocabulary or merge file can yield valid-looking IDs that point to the wrong embedding vectors for a pretrained model.
+
+### Validation included in this repository
+
+The tokenizer is tested against fixed reference outputs as well as structural invariants. `Hello world!` must encode to `[15496, 995, 0]`, and the Chapter 2 unfamiliar-string example `Akwirw ier` must encode to `[33901, 86, 343, 86, 220, 959]`. Additional tests assert that all 256 byte mappings have unique reverses, that the bundled vocabulary has 50,257 entries, that `<|endoftext|>` is ID `50256`, and that Unicode text with repeated special tokens round-trips exactly. These cases test the byte mapping, ordered merge behavior, vocabulary compatibility, special-token boundary, and decoding path together.
+
+Run the implementation directly with:
+
+```bash
+cargo run --bin gpt2_bpe
+```
+
+The program prints IDs, escaped serialized BPE pieces, and a decoded round-trip for ASCII, rare spellings, Unicode, and document-boundary examples. The older `toy_bpe_merges` program remains useful as the smallest possible illustration of merge application, while `gpt2_bpe` demonstrates the complete byte-level loading and encoding path.
+
 ## 6. Turn one long token stream into supervision (Section 2.6)
 
 After tokenization, pretraining examples come from a single sequence of token IDs. Given IDs `z₀, z₁, …`, choose a context length `L`. An input window beginning at offset `i` is `xᵢ = [zᵢ, …, zᵢ₊ₗ₋₁]`. Its target row is shifted exactly one position: `yᵢ = [zᵢ₊₁, …, zᵢ₊ₗ]`. Training later asks the model at each input position to predict the corresponding entry in the target row. [1]
@@ -183,6 +235,7 @@ From this directory, execute the following commands. No external model, network 
 cargo test
 cargo run --bin simple_tokenizer
 cargo run --bin toy_bpe_merges
+cargo run --bin gpt2_bpe
 cargo run --bin sliding_window
 cargo run --bin embeddings_and_positions
 ```
@@ -198,3 +251,4 @@ These programs deliberately optimize for inspectability. They do not implement p
 [1] Sebastian Raschka, “Working with Text Data,” Chapter 2 in *Build a Large Language Model (From Scratch)*, pp. 17–49, Manning, 2025. [Official book page][1]
 
 [1]: https://www.manning.com/books/build-a-large-language-model-from-scratch
+[2]: https://huggingface.co/openai-community/gpt2

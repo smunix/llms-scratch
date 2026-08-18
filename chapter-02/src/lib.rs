@@ -4,9 +4,12 @@
 //! token IDs -> shifted training pairs -> token embeddings + positional embeddings.
 //! They are pedagogical implementations, not production tokenizers or tensor kernels.
 
+use fancy_regex::Regex as FancyRegex;
 use itertools::Itertools;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap};
+use std::fs;
+use std::path::Path;
 
 pub const UNK: &str = "<|unk|>";
 pub const END_OF_TEXT: &str = "<|endoftext|>";
@@ -17,17 +20,17 @@ pub const END_OF_TEXT: &str = "<|endoftext|>";
 /// letter case because case can carry useful information for language modeling.
 pub fn simple_tokenize(text: &str) -> Vec<String> {
     let boundary = Regex::new(r#"--|[,.:;?_!\"()']|\s+"#).expect("tokenizer regex is valid");
-    let (mut tokens, cursor) = boundary.find_iter(text).fold(
-        (Vec::new(), 0_usize),
-        |(mut out, cursor), matched| {
-            let word = text[cursor..matched.start()].trim();
-            (!word.is_empty()).then(|| out.push(word.to_owned()));
+    let (mut tokens, cursor) =
+        boundary
+            .find_iter(text)
+            .fold((Vec::new(), 0_usize), |(mut out, cursor), matched| {
+                let word = text[cursor..matched.start()].trim();
+                (!word.is_empty()).then(|| out.push(word.to_owned()));
 
-            let separator = matched.as_str();
-            (!separator.trim().is_empty()).then(|| out.push(separator.to_owned()));
-            (out, matched.end())
-        },
-    );
+                let separator = matched.as_str();
+                (!separator.trim().is_empty()).then(|| out.push(separator.to_owned()));
+                (out, matched.end())
+            });
 
     let tail = text[cursor..].trim();
     (!tail.is_empty()).then(|| tokens.push(tail.to_owned()));
@@ -66,13 +69,13 @@ impl SimpleTokenizer {
     }
 
     /// Construct a tokenizer that replaces out-of-vocabulary tokens with `unknown_token`.
-    pub fn with_unknown(vocab: HashMap<String, usize>, unknown_token: &str) -> Result<Self, String> {
+    pub fn with_unknown(
+        vocab: HashMap<String, usize>,
+        unknown_token: &str,
+    ) -> Result<Self, String> {
         (!vocab.contains_key(unknown_token))
             .then(|| format!("unknown token {unknown_token:?} is absent from the vocabulary"))
-            .map_or_else(
-                || Ok(Self::new(vocab, Some(unknown_token.to_owned()))),
-                Err,
-            )
+            .map_or_else(|| Ok(Self::new(vocab, Some(unknown_token.to_owned()))), Err)
     }
 
     fn new(vocab: HashMap<String, usize>, unknown_token: Option<String>) -> Self {
@@ -122,7 +125,8 @@ impl SimpleTokenizer {
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .join(" ");
-        let before_punctuation = Regex::new(r#"\s+([,.:;?!\"()'])"#).expect("decode regex is valid");
+        let before_punctuation =
+            Regex::new(r#"\s+([,.:;?!\"()'])"#).expect("decode regex is valid");
         Ok(before_punctuation.replace_all(&joined, "$1").into_owned())
     }
 }
@@ -169,16 +173,22 @@ pub struct EmbeddingTable {
 impl EmbeddingTable {
     /// Make deterministic pseudo-random vectors without relying on a machine-learning framework.
     pub fn seeded(vocab_size: usize, embedding_dim: usize, seed: u64) -> Self {
-        let (_, weights) = (0..vocab_size).fold((seed, Vec::with_capacity(vocab_size)), |(state, mut rows), _| {
-            let (next_state, row) = (0..embedding_dim).fold((state, Vec::with_capacity(embedding_dim)), |(state, mut row), _| {
-                let next = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let unit = ((next >> 32) as f32) / (u32::MAX as f32);
-                row.push(unit - 0.5);
-                (next, row)
-            });
-            rows.push(row);
-            (next_state, rows)
-        });
+        let (_, weights) = (0..vocab_size).fold(
+            (seed, Vec::with_capacity(vocab_size)),
+            |(state, mut rows), _| {
+                let (next_state, row) = (0..embedding_dim).fold(
+                    (state, Vec::with_capacity(embedding_dim)),
+                    |(state, mut row), _| {
+                        let next = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let unit = ((next >> 32) as f32) / (u32::MAX as f32);
+                        row.push(unit - 0.5);
+                        (next, row)
+                    },
+                );
+                rows.push(row);
+                (next_state, rows)
+            },
+        );
         Self { weights }
     }
 
@@ -224,7 +234,11 @@ pub fn add_absolute_positions(
             if token.len() != positional.len() {
                 return Err(format!("embedding width mismatch at position {position}"));
             }
-            Ok(token.iter().zip(positional).map(|(a, b)| a + b).collect_vec())
+            Ok(token
+                .iter()
+                .zip(positional)
+                .map(|(a, b)| a + b)
+                .collect_vec())
         })
         .collect()
 }
@@ -235,7 +249,8 @@ pub fn add_absolute_positions(
 pub fn apply_bpe_merges(mut symbols: Vec<String>, merges: &[(&str, &str)]) -> Vec<String> {
     for (left, right) in merges {
         symbols = symbols.into_iter().fold(Vec::new(), |mut merged, symbol| {
-            let should_merge = merged.last().is_some_and(|previous| previous == left) && symbol == *right;
+            let should_merge =
+                merged.last().is_some_and(|previous| previous == left) && symbol == *right;
             if should_merge {
                 let previous = merged.pop().expect("last element exists when merging");
                 merged.push(format!("{previous}{symbol}"));
@@ -246,4 +261,239 @@ pub fn apply_bpe_merges(mut symbols: Vec<String>, merges: &[(&str, &str)]) -> Ve
         });
     }
     symbols
+}
+
+/// Build GPT-2's reversible byte-to-Unicode mapping.
+///
+/// GPT-2 begins with all 256 byte values, but maps bytes that are inconvenient in ordinary
+/// Unicode text (for example, the space byte) into unused Unicode code points. This lets BPE
+/// operate over Unicode strings while preserving arbitrary UTF-8 bytes without replacement
+/// characters or an unknown-token fallback.
+pub fn gpt2_byte_to_unicode() -> (HashMap<u8, char>, HashMap<char, u8>) {
+    let visible_bytes = (b'!'..=b'~')
+        .chain(0xA1_u8..=0xAC_u8)
+        .chain(0xAE_u8..=0xFF_u8)
+        .collect_vec();
+
+    let mut byte_values = visible_bytes.clone();
+    let mut code_points = visible_bytes.iter().map(|byte| *byte as u32).collect_vec();
+    let mut next_code_point = 256_u32;
+
+    (0_u8..=255_u8)
+        .filter(|byte| !visible_bytes.contains(byte))
+        .for_each(|byte| {
+            byte_values.push(byte);
+            code_points.push(next_code_point);
+            next_code_point += 1;
+        });
+
+    let byte_to_unicode = byte_values
+        .into_iter()
+        .zip(code_points)
+        .map(|(byte, code_point)| {
+            (
+                byte,
+                char::from_u32(code_point)
+                    .expect("GPT-2 byte mapping uses valid Unicode code points"),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let unicode_to_byte = byte_to_unicode
+        .iter()
+        .map(|(byte, character)| (*character, *byte))
+        .collect::<HashMap<_, _>>();
+
+    (byte_to_unicode, unicode_to_byte)
+}
+
+/// A byte-level BPE tokenizer compatible with released GPT-2 `encoder.json` and `vocab.bpe`
+/// artifacts.
+///
+/// The tokenizer deliberately keeps its artifact loader public. A vocabulary, merge list, and
+/// embedding table are a matched set: swapping any one of them changes the IDs a GPT model sees.
+#[derive(Debug, Clone)]
+pub struct Gpt2BpeTokenizer {
+    encoder: HashMap<String, u32>,
+    decoder: HashMap<u32, String>,
+    merge_ranks: HashMap<(String, String), usize>,
+    byte_encoder: HashMap<u8, char>,
+    byte_decoder: HashMap<char, u8>,
+    pretokenizer: FancyRegex,
+    special_tokens: HashMap<String, u32>,
+}
+
+impl Gpt2BpeTokenizer {
+    /// Load the standard GPT-2 vocabulary JSON and BPE merge file.
+    ///
+    /// `encoder_path` maps serialized BPE strings to IDs. `merges_path` begins with a version
+    /// header; every later non-empty line is an ordered pair whose file order determines rank.
+    pub fn from_files(
+        encoder_path: impl AsRef<Path>,
+        merges_path: impl AsRef<Path>,
+    ) -> Result<Self, String> {
+        let encoder_path = encoder_path.as_ref();
+        let merges_path = merges_path.as_ref();
+        let encoder_json = fs::read_to_string(encoder_path)
+            .map_err(|error| format!("could not read {}: {error}", encoder_path.display()))?;
+        let encoder = serde_json::from_str::<HashMap<String, u32>>(&encoder_json)
+            .map_err(|error| format!("could not parse {}: {error}", encoder_path.display()))?;
+        let decoder = encoder
+            .iter()
+            .map(|(token, id)| (*id, token.clone()))
+            .collect::<HashMap<_, _>>();
+        if decoder.len() != encoder.len() {
+            return Err("encoder.json maps multiple token strings to the same token ID".to_owned());
+        }
+
+        let merges_text = fs::read_to_string(merges_path)
+            .map_err(|error| format!("could not read {}: {error}", merges_path.display()))?;
+        let merge_ranks = merges_text
+            .lines()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+            .map(|(rank, line)| {
+                let pair = line.split_whitespace().collect_vec();
+                (pair.len() == 2)
+                    .then(|| ((pair[0].to_owned(), pair[1].to_owned()), rank))
+                    .ok_or_else(|| format!("invalid BPE merge line: {line:?}"))
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        let (byte_encoder, byte_decoder) = gpt2_byte_to_unicode();
+        let pretokenizer = FancyRegex::new(
+            r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+        )
+        .map_err(|error| format!("could not build GPT-2 pre-tokenizer: {error}"))?;
+        let special_tokens = [END_OF_TEXT]
+            .into_iter()
+            .filter_map(|token| encoder.get(token).map(|id| (token.to_owned(), *id)))
+            .collect();
+
+        Ok(Self {
+            encoder,
+            decoder,
+            merge_ranks,
+            byte_encoder,
+            byte_decoder,
+            pretokenizer,
+            special_tokens,
+        })
+    }
+
+    pub fn vocabulary_size(&self) -> usize {
+        self.encoder.len()
+    }
+
+    pub fn special_token_id(&self, token: &str) -> Option<u32> {
+        self.special_tokens.get(token).copied()
+    }
+
+    pub fn token_for_id(&self, id: u32) -> Option<&str> {
+        self.decoder.get(&id).map(String::as_str)
+    }
+
+    /// Return GPT-2's serialized BPE token strings before their conversion to integer IDs.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<String>, String> {
+        text.split(END_OF_TEXT)
+            .enumerate()
+            .try_fold(Vec::new(), |mut pieces, (index, segment)| {
+                (index > 0).then(|| pieces.push(END_OF_TEXT.to_owned()));
+                pieces.extend(self.tokenize_without_special(segment)?);
+                Ok(pieces)
+            })
+    }
+
+    /// Convert text to GPT-2 vocabulary IDs. The method preserves `<|endoftext|>` as its special ID.
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+        self.tokenize(text)?
+            .into_iter()
+            .map(|piece| {
+                self.encoder.get(&piece).copied().ok_or_else(|| {
+                    format!("BPE result is absent from the loaded vocabulary: {piece:?}")
+                })
+            })
+            .collect()
+    }
+
+    /// Decode GPT-2 IDs back into UTF-8 text by reversing both the vocabulary lookup and byte map.
+    pub fn decode(&self, ids: &[u32]) -> Result<String, String> {
+        let byte_stream = ids
+            .iter()
+            .map(|id| {
+                self.decoder
+                    .get(id)
+                    .ok_or_else(|| format!("unknown token ID: {id}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .flat_map(|token| token.chars())
+            .map(|character| {
+                self.byte_decoder.get(&character).copied().ok_or_else(|| {
+                    format!("token character is not part of the GPT-2 byte map: {character:?}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        String::from_utf8(byte_stream)
+            .map_err(|error| format!("decoded bytes are not valid UTF-8: {error}"))
+    }
+
+    fn tokenize_without_special(&self, text: &str) -> Result<Vec<String>, String> {
+        self.pretokenizer
+            .find_iter(text)
+            .map(|matched| {
+                let matched =
+                    matched.map_err(|error| format!("GPT-2 pre-tokenization failed: {error}"))?;
+                let byte_encoded = matched
+                    .as_str()
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| {
+                        self.byte_encoder
+                            .get(byte)
+                            .copied()
+                            .ok_or_else(|| format!("missing byte mapping for {byte}"))
+                    })
+                    .collect::<Result<String, _>>()?;
+                Ok(self.apply_ranked_bpe(&byte_encoded))
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(|groups| groups.into_iter().flatten().collect())
+    }
+
+    fn apply_ranked_bpe(&self, byte_encoded_piece: &str) -> Vec<String> {
+        let mut symbols = byte_encoded_piece
+            .chars()
+            .map(|character| character.to_string())
+            .collect_vec();
+
+        while symbols.len() > 1 {
+            let best_pair = symbols
+                .windows(2)
+                .filter_map(|window| {
+                    let pair = (window[0].clone(), window[1].clone());
+                    self.merge_ranks.get(&pair).map(|rank| (*rank, pair))
+                })
+                .min_by_key(|(rank, _)| *rank)
+                .map(|(_, pair)| pair);
+
+            let Some((left, right)) = best_pair else {
+                break;
+            };
+            symbols = symbols.into_iter().fold(Vec::new(), |mut merged, symbol| {
+                let should_merge =
+                    merged.last().is_some_and(|previous| previous == &left) && symbol == right;
+                if should_merge {
+                    let previous = merged
+                        .pop()
+                        .expect("an element exists when BPE merges a pair");
+                    merged.push(format!("{previous}{symbol}"));
+                } else {
+                    merged.push(symbol);
+                }
+                merged
+            });
+        }
+        symbols
+    }
 }

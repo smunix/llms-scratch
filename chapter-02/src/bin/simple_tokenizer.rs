@@ -21,7 +21,10 @@ fn main() -> Result<(), String> {
     let combined = format!("Hello, Rustacean! {END_OF_TEXT} This is a corpus.");
     let robust_ids = tokenizer.encode(&combined)?;
 
-    println!("Vocabulary size including special tokens: {}", tokenizer.vocab_size());
+    println!(
+        "Vocabulary size including special tokens: {}",
+        tokenizer.vocab_size()
+    );
     println!("Fallback encode: {robust_ids:?}");
     println!("Fallback decode: {}", tokenizer.decode(&robust_ids)?);
     Ok(())

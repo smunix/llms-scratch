@@ -6,7 +6,7 @@ This private study repository contains original Rust implementations and explana
 
 | Folder | Coverage | Getting started |
 |---|---|---|
-| [`chapter-02`](chapter-02) | Text data preparation: tokenization, token IDs, special tokens, toy BPE merge application, sliding-window supervision, token embeddings, and absolute positional embeddings. | Read `chapter-02/README.md`, then run `cargo test` from that directory. |
+| [`chapter-02`](chapter-02) | Text data preparation: tokenization, token IDs, special tokens, toy and GPT-2-compatible byte-level BPE, sliding-window supervision, token embeddings, and absolute positional embeddings. | Read `chapter-02/README.md`, run `cargo test`, then use `cargo run --bin gpt2_bpe`. |
 
 ## Conventions
 

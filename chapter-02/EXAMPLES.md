@@ -58,6 +58,39 @@ assert_eq!(result, vec!["low", "er"]);
 
 This is not a compatible implementation of a GPT tokenizer. A production implementation must operate on bytes, correctly handle Unicode and leading spaces, manage a large learned vocabulary and merge-ranking table, and define special-token behavior. Use a mature tokenizer that matches the model checkpoint in real projects.
 
+## `gpt2_bpe`
+
+### What the code does
+
+`gpt2_bpe` is the complete, artifact-backed counterpart to `toy_bpe_merges`. It loads `assets/gpt2/encoder.json` and `assets/gpt2/vocab.bpe` through `Gpt2BpeTokenizer::from_files`, then reports each sample’s integer IDs, escaped serialized BPE pieces, and decoded result. The artifacts describe a **50,257-token byte-level BPE vocabulary**, including `<|endoftext|>` at ID `50256`. [1]
+
+```rust
+let tokenizer = Gpt2BpeTokenizer::from_files(
+    asset_dir.join("encoder.json"),
+    asset_dir.join("vocab.bpe"),
+)?;
+let ids = tokenizer.encode("Hello world!")?;
+assert_eq!(ids, vec![15496, 995, 0]);
+assert_eq!(tokenizer.decode(&ids)?, "Hello world!");
+```
+
+The code has five distinct parts. First, the GPT-2-style pre-tokenizer separates contractions, words, numbers, punctuation runs, and whitespace groups. Second, `gpt2_byte_to_unicode` maps all 256 possible byte values to printable or otherwise unused Unicode code points. This preserves all UTF-8 bytes exactly while still letting the BPE algorithm manipulate a Unicode `String`.
+
+Third, `apply_ranked_bpe` starts from those mapped characters. On every iteration it finds the adjacent pair that appears earliest in the merge file, merges all non-overlapping occurrences of that pair, and repeats until no learned merge remains. Fourth, the completed subword strings retrieve IDs from `encoder.json`. Finally, decoding reverses the ID lookup and byte-to-Unicode mapping before validating the resulting bytes as UTF-8.
+
+| Input type | Expected behavior | How `gpt2_bpe` demonstrates it |
+|---|---|---|
+| Common English | Frequent words become compact vocabulary tokens. | `Hello world!` emits the reference IDs `15496`, `995`, and `0`. |
+| Unfamiliar spelling | The text decomposes into learned subwords or byte-derived pieces. | `Akwirw ier` shows the Chapter 2 reference IDs. |
+| Unicode | UTF-8 bytes survive the reversible byte mapping. | `Café 🤖` decodes exactly after encoding. |
+| Document boundary | `<|endoftext|>` remains its reserved token, not ordinary punctuation. | A two-document sample reports its special-token ID. |
+
+### Important compatibility boundary
+
+A GPT-2 checkpoint is only compatible with the exact vocabulary, merge ranks, and embedding table that were trained together. This implementation uses the released GPT-2 vocabulary and merge artifacts, so its emitted IDs can be used with the corresponding GPT-2 embedding matrix. Reusing the code with another model requires loading that model’s matching artifacts; mixing artifacts can produce valid integers that select incorrect embedding rows. [1]
+
+The project bundles the two tokenizer artifacts only as test fixtures and learning material. They are not a model-weight download, and the example does not run inference or call an external service. The implementation also makes no attempt to be a faster replacement for mature tokenization runtimes; it favors a readable, validated implementation of the algorithmic contract.
+
 ## `sliding_window`
 
 ### What the code does
@@ -124,3 +157,9 @@ The function validates that sequence lengths match and that every token vector a
 ## Suggested experiments
 
 Change only one variable at a time and compare the printed data. Add a punctuation character to `simple_tokenize`; then observe the new vocabulary. Run `sliding_window` with a stride larger than the context length and note the skipped IDs. Change the two embedding dimensions in `embeddings_and_positions` and confirm that position addition still needs matching widths. Finally, reverse the order of two BPE merges and observe that the resulting subwords can change. These experiments connect implementation details to the chapter’s core theme: data representation determines what the model can learn from.
+
+## Reference
+
+[1] GPT-2 model card, “openai-community/gpt2,” Hugging Face. [Model card][1]
+
+[1]: https://huggingface.co/openai-community/gpt2
