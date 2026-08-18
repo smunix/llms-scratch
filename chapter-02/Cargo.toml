@@ -12,7 +12,6 @@ half = "=2.3.1"
 # Constrains Candle's Zip dependency away from an Edition 2024-only IndexMap release.
 indexmap = "=2.2.6"
 itertools = "0.12"
-nalgebra = "0.32"
 # Constrains Candle's optional num_enum macro helper to a Cargo 1.75-compatible release.
 proc-macro-crate = "=3.1.0"
 # Keeps Candle's CPU parallel runtime within the Rust 1.75 compatibility range.

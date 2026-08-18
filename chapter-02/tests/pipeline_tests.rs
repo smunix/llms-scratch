@@ -1,9 +1,9 @@
+use candle_core::{Device, Tensor};
 use chapter_02_text_data::{
     add_absolute_positions, apply_bpe_merges, build_vocab, candle_input_embeddings,
     gpt2_byte_to_unicode, simple_tokenize, sliding_window_examples, EmbeddingTable,
     Gpt2BpeTokenizer, SimpleTokenizer, END_OF_TEXT, UNK,
 };
-use nalgebra::DMatrix;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 
@@ -50,27 +50,33 @@ fn sliding_window_creates_one_position_shifted_targets() {
 }
 
 #[test]
-fn nalgebra_embedding_lookup_retrieves_rows_and_position_vectors_are_added_elementwise() {
+fn candle_embedding_lookup_retrieves_rows_and_position_vectors_are_added_elementwise() {
     let table = EmbeddingTable::seeded(6, 3, 123);
     let first_lookup = table.lookup(&[3]).expect("ID is in range");
     let repeated_lookup = table.lookup(&[3, 3]).expect("IDs are in range");
-    assert_eq!(first_lookup.nrows(), 1);
-    assert_eq!(repeated_lookup.nrows(), 2);
-    assert_eq!(first_lookup.row(0), repeated_lookup.row(0));
-    assert_eq!(repeated_lookup.row(0), repeated_lookup.row(1));
+    assert_eq!(first_lookup.dims(), &[1, 3]);
+    assert_eq!(repeated_lookup.dims(), &[2, 3]);
+    let first_values = first_lookup.to_vec2::<f32>().expect("values materialize");
+    let repeated_values = repeated_lookup
+        .to_vec2::<f32>()
+        .expect("values materialize");
+    assert_eq!(first_values[0], repeated_values[0]);
+    assert_eq!(repeated_values[0], repeated_values[1]);
 
-    let token_vectors = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 3.0, 4.0]);
-    let position_vectors = DMatrix::from_row_slice(2, 2, &[0.5, 0.5, -1.0, 1.0]);
+    let token_vectors = Tensor::from_vec(vec![1.0_f32, 2.0, 3.0, 4.0], (2, 2), &Device::Cpu)
+        .expect("token tensor is valid");
+    let position_vectors = Tensor::from_vec(vec![0.5_f32, 0.5, -1.0, 1.0], (2, 2), &Device::Cpu)
+        .expect("position tensor is valid");
     let combined =
         add_absolute_positions(&token_vectors, &position_vectors).expect("matching shapes");
     assert_eq!(
-        combined,
-        DMatrix::from_row_slice(2, 2, &[1.5, 2.5, 2.0, 5.0])
+        combined.to_vec2::<f32>().expect("values materialize"),
+        vec![vec![1.5, 2.5], vec![2.0, 5.0]]
     );
 }
 
 #[test]
-fn candle_and_nalgebra_paths_produce_the_same_input_embeddings() {
+fn explicit_and_helper_candle_paths_produce_the_same_input_embeddings() {
     let token_table = EmbeddingTable::seeded(8, 3, 123);
     let position_table = EmbeddingTable::seeded(4, 3, 999);
     let token_ids = [2, 3, 5, 1];
@@ -82,16 +88,15 @@ fn candle_and_nalgebra_paths_produce_the_same_input_embeddings() {
             .lookup(&position_ids)
             .expect("valid position IDs"),
     )
-    .expect("matching matrix shapes");
-    let candle = candle_input_embeddings(&token_table, &position_table, &token_ids)
+    .expect("matching tensor shapes");
+    let helper = candle_input_embeddings(&token_table, &position_table, &token_ids)
         .expect("Candle input construction succeeds");
-    assert_eq!(candle.dims(), &[4, 3]);
-    let candle_values = candle.to_vec2::<f32>().expect("Candle values materialize");
+    assert_eq!(helper.dims(), &[4, 3]);
+    let helper_values = helper.to_vec2::<f32>().expect("Candle values materialize");
     let expected_values = expected
-        .row_iter()
-        .map(|row| row.iter().copied().collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    assert_eq!(candle_values, expected_values);
+        .to_vec2::<f32>()
+        .expect("Candle values materialize");
+    assert_eq!(helper_values, expected_values);
 }
 
 fn gpt2_tokenizer() -> Gpt2BpeTokenizer {
