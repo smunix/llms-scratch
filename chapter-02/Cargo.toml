@@ -1,0 +1,12 @@
+[package]
+name = "chapter-02-text-data"
+version = "0.1.0"
+edition = "2021"
+description = "Runnable Rust examples for Chapter 2: Working with text data"
+
+[dependencies]
+itertools = "0.12"
+regex = "1.10"
+
+[dev-dependencies]
+pretty_assertions = "1.4"
